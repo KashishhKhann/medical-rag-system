@@ -1,0 +1,17 @@
+.DS_Store
+.env
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+venv310/
+
+# Local data and artifacts
+data/
+*.index
+*mapping.json
+MIMIC*.json
+answers*.csv
+generation_eval*.csv
+evidence_retrieval*.csv
