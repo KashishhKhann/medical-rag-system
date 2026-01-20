@@ -37,6 +37,9 @@ from config import (
     USE_CHILD_SPANS, CHILD_SPAN_TARGET_TOKENS, CHILD_SPAN_MAX_TOKENS,
     CHILD_SPAN_MIN_TOKENS, CHILD_SPAN_OVERLAP_TOKENS, CHILD_SPAN_TOP_K,
     CHILD_SPAN_MAX_PER_PARENT,
+    SECTION_BONUS_WEIGHT,
+    USE_BM25_RERANK, BM25_WEIGHT, BM25_K1, BM25_B,
+    OLLAMA_TIMEOUT_SEC,
 )
 
 MONGO_DB = DB_NAME
@@ -225,6 +228,21 @@ STOP_CONCEPTS = {
     "mg", "mcg", "po", "iv", "tid", "bid", "qhs", "daily"
 }
 
+SECTION_HINTS = {
+    "chief_complaint": [
+        "chief complaint", "reason for admission", "reason for visit", "cc",
+    ],
+    "hpi": ["history of present illness", "hpi", "present illness"],
+    "pmh": ["past medical history", "pmh"],
+    "physical_exam": ["physical exam", "physical examination", "pe"],
+    "hospital_course": ["hospital course", "brief hospital course"],
+    "meds_discharge": [
+        "discharge medications", "discharge meds", "medications on discharge",
+        "meds on discharge", "discharge diagnosis", "discharge disposition",
+    ],
+    "header": ["allergies", "service admitted", "service"],
+}
+
 _SENT_SPLITTER = None
 _TOKENIZER = None
 
@@ -335,6 +353,61 @@ def concept_match_score(concept_norm: str, q_norm: str, q_tokens: List[str], q_t
         score = max(score, fuzzy_ratio)
     return score
 
+def tokenize_for_bm25(text: str) -> List[str]:
+    norm = normalize_text(text)
+    return [t for t in norm.split() if len(t) >= 2]
+
+def bm25_scores(
+    query_tokens: List[str],
+    docs_tokens: List[List[str]],
+    k1: float = BM25_K1,
+    b: float = BM25_B,
+) -> List[float]:
+    if not query_tokens or not docs_tokens:
+        return [0.0 for _ in docs_tokens]
+
+    df: Dict[str, int] = {}
+    for tokens in docs_tokens:
+        for t in set(tokens):
+            df[t] = df.get(t, 0) + 1
+
+    N = len(docs_tokens)
+    avgdl = sum(len(t) for t in docs_tokens) / max(1, N)
+
+    scores: List[float] = []
+    for tokens in docs_tokens:
+        freqs: Dict[str, int] = {}
+        for t in tokens:
+            freqs[t] = freqs.get(t, 0) + 1
+        dl = len(tokens)
+        score = 0.0
+        for t in query_tokens:
+            f = freqs.get(t)
+            if not f:
+                continue
+            idf = math.log(1.0 + (N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
+            denom = f + k1 * (1.0 - b + b * (dl / max(1.0, avgdl)))
+            score += idf * (f * (k1 + 1.0)) / denom
+        scores.append(score)
+    return scores
+
+def infer_section_bias(question: str) -> set:
+    q_norm = normalize_text(question)
+    if not q_norm:
+        return set()
+    matches = set()
+    for section, terms in SECTION_HINTS.items():
+        for term in terms:
+            if " " in term:
+                if term in q_norm:
+                    matches.add(section)
+                    break
+            else:
+                if re.search(rf"\\b{re.escape(term)}\\b", q_norm):
+                    matches.add(section)
+                    break
+    return matches
+
 def get_concepts_for_chunks(driver, chunk_ids: List[str]) -> Dict[str, List[str]]:
     """
     Batch fetch concepts for many chunks in a single Neo4j query.
@@ -407,7 +480,14 @@ def hybrid_rank(
     chunk_ids = [c["chunk_id"] for c in candidates]
     concepts_map = get_concepts_for_chunks(driver, chunk_ids)
     concept_freq = build_concept_freq(concepts_map)
+    section_bias = infer_section_bias(question)
     q_norm, q_tokens, q_token_set = prepare_question(question)
+    bm25_q = tokenize_for_bm25(question)
+    bm25_docs = [
+        tokenize_for_bm25((c["doc"].get("text") or c["doc"].get("full_text") or ""))
+        for c in candidates
+    ]
+    bm25_vals = bm25_scores(bm25_q, bm25_docs) if USE_BM25_RERANK else [0.0] * len(candidates)
 
     enriched: List[Dict[str, Any]] = []
     for c in candidates:
@@ -416,8 +496,15 @@ def hybrid_rank(
         kg_matched, kg_score = compute_kg_score(
             concepts, q_norm, q_tokens, q_token_set, concept_freq
         )
+        section_bonus = 1.0 if c["doc"].get("section") in section_bias else 0.0
         enriched.append(
-            {**c, "concepts": concepts, "kg_score": kg_score, "kg_matched": kg_matched}
+            {
+                **c,
+                "concepts": concepts,
+                "kg_score": kg_score,
+                "kg_matched": kg_matched,
+                "section_bonus": section_bonus,
+            }
         )
 
     faiss_vals = [e["faiss_score"] for e in enriched]
@@ -433,9 +520,15 @@ def hybrid_rank(
 
     faiss_norm = minmax(faiss_vals)
     kg_norm = minmax(kg_vals)
+    bm25_norm = minmax(bm25_vals)
 
-    for e, fn, kn in zip(enriched, faiss_norm, kg_norm):
-        e["hybrid_score"] = alpha * fn + beta * kn
+    for e, fn, kn, bn in zip(enriched, faiss_norm, kg_norm, bm25_norm):
+        e["hybrid_score"] = (
+            alpha * fn
+            + beta * kn
+            + (SECTION_BONUS_WEIGHT * e["section_bonus"])
+            + (BM25_WEIGHT * bn)
+        )
 
     enriched.sort(key=lambda x: x["hybrid_score"], reverse=True)
     return enriched[:top_k]
@@ -658,7 +751,7 @@ ANSWER:
             "stream": False,
             "options": {"temperature": 0.2, "num_predict": 512},
         },
-        timeout=600,
+        timeout=OLLAMA_TIMEOUT_SEC,
     )
     resp.raise_for_status()
     data = resp.json()

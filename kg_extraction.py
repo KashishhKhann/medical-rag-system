@@ -10,6 +10,7 @@ This is a lightweight, robust KG just for signal & reasoning.
 """
 
 import os
+import argparse
 from typing import List
 
 from pymongo import MongoClient
@@ -90,12 +91,12 @@ def extract_concepts(text: str) -> List[str]:
             out.append(e)
     return out
 
-def main():
+def main(limit: int | None = None):
     print("\n------------------------")
     print("Running KG Extraction over processed_chunks -> Neo4j")
     print("------------------------\n")
 
-    chunks = get_chunks_to_process()
+    chunks = get_chunks_to_process(limit)
     total = len(chunks)
     print(f"Chunks to process (kg_status != 'done'): {total}")
 
@@ -114,11 +115,30 @@ def main():
                 {"_id": doc["_id"]}, {"$set": {"kg_status": "skipped_empty"}}
             )
             continue
-
         try:
             concepts = extract_concepts(text)
-            with driver.session() as session:
-                session.execute_write(process_chunk, cid, concepts)
+            try:
+                with driver.session() as session:
+                    session.execute_write(process_chunk, cid, concepts)
+            except Exception as e:
+                msg = str(e)
+                print(f"\nError writing to Neo4j for chunk {cid}: {msg}")
+                # Detect common auth / rate-limit issues and abort so user can fix credentials/service
+                if "AuthenticationRateLimit" in msg or "Unauthorized" in msg or "authentication" in msg.lower():
+                    print("Detected Neo4j authentication/rate-limit error. Aborting run. Check credentials and restart Neo4j.")
+                    chunks_col.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"kg_status": "error_auth", "kg_error": msg}},
+                    )
+                    count_failed += 1
+                    break
+                else:
+                    chunks_col.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"kg_status": "error", "kg_error": msg}},
+                    )
+                    count_failed += 1
+                    continue
 
             chunks_col.update_one(
                 {"_id": doc["_id"]},
@@ -144,4 +164,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="KG extraction from processed_chunks -> Neo4j")
+    p.add_argument("--limit", type=int, default=None, help="Process at most N chunks (for smoke tests)")
+    args = p.parse_args()
+    main(limit=args.limit)

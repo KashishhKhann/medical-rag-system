@@ -12,7 +12,7 @@ from bert_score import score as bertscore
 
 from config import (
     MONGO_URI, DB_NAME, CHUNKS_COLLECTION,
-    OLLAMA_URL, OLLAMA_MODEL
+    OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SEC
 )
 
 EXTRACTIVE_TASKS_ALLOWLIST = {
@@ -79,7 +79,7 @@ Answer concisely and accurately:
             "stream": False,
             "options": {"temperature": 0.2, "num_predict": 256},
         },
-        timeout=600,
+        timeout=OLLAMA_TIMEOUT_SEC,
     )
     resp.raise_for_status()
     out = resp.json().get("response", "").strip()
