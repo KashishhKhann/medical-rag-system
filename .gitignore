@@ -2,16 +2,28 @@
 .env
 __pycache__/
 *.pyc
+*.pyo
 
 # Virtual environments
 venv/
 venv310/
+.venv/
 
-# Local data and artifacts
-data/
-*.index
-*mapping.json
+# Large data files — provide your own MIMIC data
 MIMIC*.json
+*.filtered_notes.json
+data/
+
+# FAISS index artifacts
+*.index
+*.faiss
+*mapping.json
+
+# Generated output files
 answers*.csv
 generation_eval*.csv
 evidence_retrieval*.csv
+
+# IDE
+.idea/
+.vscode/
